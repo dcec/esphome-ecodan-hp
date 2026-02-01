@@ -3,19 +3,15 @@
 namespace esphome {
 namespace ecodan 
 { 
-    static auto last_proxy_activity = std::chrono::steady_clock::now();
-    bool proxy_timedout() {
-        auto now = std::chrono::steady_clock::now();
-        return now - last_proxy_activity > std::chrono::minutes(2);
-    }
-
     void EcodanHeatpump::proxy_ping() {
-        last_proxy_activity = std::chrono::steady_clock::now();
+        this->last_proxy_activity_.store(std::chrono::steady_clock::now());
     } 
 
     bool EcodanHeatpump::proxy_available() {
-        return proxy_uart_ && !proxy_timedout();
-    }
-
+        auto now = std::chrono::steady_clock::now();
+        auto timeout = now - this->last_proxy_activity_.load() > std::chrono::seconds(60);
+        return this->proxy_uart_ && this->slaveDetected && !timeout;
+    } 
+    
 } // namespace ecodan
 } // namespace esphome

@@ -2,10 +2,15 @@
 .pio
 .esphome
 venv
+build.yaml
+proxy.yaml
+asgard.yaml
 Firmware.bin
 sdkconfig.esp32dev
 CMakeLists.txt
 firmware.bin
 components/ecodan/__pycache__/*
+components/optimizer/__pycache__/*
 secrets.yaml
 .python-version
+*.DS_Store

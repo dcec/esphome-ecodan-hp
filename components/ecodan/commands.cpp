@@ -201,7 +201,7 @@ namespace ecodan
 
     bool EcodanHeatpump::schedule_cmd(Message& cmd)
     {   
-        cmdQueue.emplace(std::move(cmd));
+        cmdQueue.emplace(QueuedCommand{std::move(cmd), 0, 0});
         return dispatch_next_cmd();
     }
 
@@ -211,7 +211,7 @@ namespace ecodan
         Message{MsgType::GET_CMD, GetType::DIP_SWITCHES}
     };
 
-    #define MAX_STATUS_CMD_SIZE 20
+    #define MAX_STATUS_CMD_SIZE 21
     Message statusCmdQueue[MAX_STATUS_CMD_SIZE] = {
         Message{MsgType::GET_CMD, GetType::DATETIME_FIRMWARE},
         Message{MsgType::GET_CMD, GetType::DEFROST_STATE},
@@ -227,7 +227,8 @@ namespace ecodan
         Message{MsgType::GET_CMD, GetType::TEMPERATURE_STATE_D},
         Message{MsgType::GET_CMD, GetType::EXTERNAL_STATE},
         Message{MsgType::GET_CMD, GetType::ACTIVE_TIME},
-        Message{MsgType::GET_CMD, GetType::PUMP_STATUS},
+        Message{MsgType::GET_CMD, GetType::PUMP_STATUS_A},
+        Message{MsgType::GET_CMD, GetType::PUMP_STATUS_B},
         Message{MsgType::GET_CMD, GetType::FLOW_RATE},
         Message{MsgType::GET_CMD, GetType::MODE_FLAGS_A},
         Message{MsgType::GET_CMD, GetType::MODE_FLAGS_B},
@@ -244,15 +245,15 @@ namespace ecodan
 
     #define MAX_SERVICE_CODE_CMD_SIZE 5
     ServiceCodeRuntime serviceCodeCmdQueue[MAX_SERVICE_CODE_CMD_SIZE] = {
-        ServiceCodeRuntime{Status::REQUEST_CODE::COMPRESSOR_STARTS, false, 30*60, std::chrono::steady_clock::now() - std::chrono::seconds(60*60)},
+        ServiceCodeRuntime{Status::REQUEST_CODE::COMPRESSOR_STARTS, false, 60*60, std::chrono::steady_clock::now() - std::chrono::seconds(60*60)},
         ServiceCodeRuntime{Status::REQUEST_CODE::TH4_DISCHARGE_TEMP, true, 0, std::chrono::steady_clock::time_point{}},
         ServiceCodeRuntime{Status::REQUEST_CODE::TH3_LIQUID_PIPE1_TEMP, true, 0, std::chrono::steady_clock::time_point{}},
-        ServiceCodeRuntime{Status::REQUEST_CODE::TH6_2_PHASE_PIPE_TEMP, true, 0, std::chrono::steady_clock::time_point{}},
+        //ServiceCodeRuntime{Status::REQUEST_CODE::TH6_2_PHASE_PIPE_TEMP, true, 0, std::chrono::steady_clock::time_point{}},
         //ServiceCodeRuntime{Status::REQUEST_CODE::TH32_SUCTION_PIPE_TEMP, true, 0, std::chrono::steady_clock::time_point{}},
         //ServiceCodeRuntime{Status::REQUEST_CODE::TH8_HEAT_SINK_TEMP, true, 0, std::chrono::steady_clock::time_point{}},
-        //ServiceCodeRuntime{Status::REQUEST_CODE::DISCHARGE_SUPERHEAT, true, 0, std::chrono::steady_clock::time_point{}},
+        ServiceCodeRuntime{Status::REQUEST_CODE::DISCHARGE_SUPERHEAT, true, 0, std::chrono::steady_clock::time_point{}},
         //ServiceCodeRuntime{Status::REQUEST_CODE::SUB_COOL, true, 0, std::chrono::steady_clock::time_point{}},
-        ServiceCodeRuntime{Status::REQUEST_CODE::FAN_SPEED, false, 0, std::chrono::steady_clock::time_point{}}
+        ServiceCodeRuntime{Status::REQUEST_CODE::FAN_SPEED, false, 2*60, std::chrono::steady_clock::time_point{}}
     };
 
     bool EcodanHeatpump::dispatch_next_status_cmd()
@@ -293,7 +294,7 @@ namespace ecodan
 
         cmdIndex = (cmdIndex + 1) % (!initialCmdCompleted() ? MAX_INITIAL_CMD_SIZE : MAX_STATUS_CMD_SIZE);
         auto& cmd = !initialCmdCompleted() ? initialCmdQueue[cmdIndex] : statusCmdQueue[cmdIndex];
-        if (!serial_tx(uart_, cmd))
+        if (!serial_tx(cmd))
         {
             ESP_LOGI(TAG, "Unable to dispatch status update request, flushing queued requests...");
             cmdIndex = 0;
@@ -305,50 +306,75 @@ namespace ecodan
     }
 
     bool EcodanHeatpump::handle_active_request_codes() {
+
+        const unsigned long REQUEST_RETRY_INTERVAL = 1*1000; 
+        static unsigned long last_svc_request_time = 0;
+
         if (activeRequestCode != Status::REQUEST_CODE::NONE) {
-            Message svc_cmd{MsgType::GET_CMD, GetType::SERVICE_REQUEST_CODE, static_cast<int16_t>(activeRequestCode)};
-            if (!serial_tx(uart_, svc_cmd))
-            {
-                ESP_LOGI(TAG, "Unable to dispatch status update request, flushing queued requests...");
-                reset_connection();
-                return false;
+            unsigned long current_time = millis();
+            if (current_time - last_svc_request_time >= REQUEST_RETRY_INTERVAL) {
+                ESP_LOGD(TAG, "Sending active service request (code %d)...", activeRequestCode);
+                Message svc_cmd{MsgType::GET_CMD, GetType::SERVICE_REQUEST_CODE, static_cast<int16_t>(activeRequestCode)};
+                if (!serial_tx(svc_cmd))
+                {
+                    ESP_LOGI(TAG, "Unable to dispatch status update request, flushing queued requests...");
+                    reset_connection();
+                    return false;
+                }
+                last_svc_request_time = current_time;
             }
+
             return false;
         }
-
-        return true;
+        return true; 
     }
 
     bool EcodanHeatpump::dispatch_next_cmd()
     {
-        if (!handle_active_request_codes())
-            return true;
-
         if (cmdQueue.empty())
         {
             return true;
         }
         
-        //ESP_LOGI(TAG, msg.debug_dump_packet().c_str());
+        QueuedCommand& pending_cmd = cmdQueue.front();
+        const unsigned long CMD_TIMEOUT_MS = 1000;
+        const uint8_t MAX_RETRIES = 30;
+        if (pending_cmd.last_sent_time != 0 && (millis() - pending_cmd.last_sent_time < CMD_TIMEOUT_MS)) {
+            return true;
+        }
+        if (pending_cmd.retries >= MAX_RETRIES) {
+            ESP_LOGE(TAG, "Command failed after %d retries. Discarding.", MAX_RETRIES);
+            cmdQueue.pop();
+            return true;
+        }
 
-        if (!serial_tx(uart_, cmdQueue.front()))
-        {
-            ESP_LOGI(TAG, "Unable to dispatch status update request, flushing queued requests...");
+        if (pending_cmd.last_sent_time != 0) {
+            ESP_LOGW(TAG, "Command timed out. Retrying (attempt %d/%d)...[%d]", pending_cmd.retries + 1, MAX_RETRIES, cmdQueue.size());
+        }
+
+        if (!serial_tx(pending_cmd.message)) {
+            ESP_LOGE(TAG, "Failed to send command to serial.");
             reset_connection();
             return false;
         }
 
+        pending_cmd.retries++;
+        pending_cmd.last_sent_time = millis();
+        
         return true;
     }
 
     bool EcodanHeatpump::begin_connect()
     {
+        if (proxy_available())
+            return true;
+
         Message cmd{MsgType::CONNECT_CMD};
         uint8_t payload[2] = {0xCA, 0x01};
         cmd.write_payload(payload, sizeof(payload));
 
         ESP_LOGI(TAG, "Attempt to tx CONNECT_CMD!");
-        if (!serial_tx(uart_, cmd))
+        if (!serial_tx(cmd))
         {
             ESP_LOGI(TAG, "Failed to tx CONNECT_CMD!");
             return false;
@@ -359,12 +385,15 @@ namespace ecodan
 
     bool EcodanHeatpump::disconnect()
     {
+        if (proxy_available())
+            return true;
+
         Message cmd{MsgType::CONNECT_CMD};
         uint8_t payload[2] = {0xCA, 0x02};
         cmd.write_payload(payload, sizeof(payload));
 
         ESP_LOGI(TAG, "Attempt to tx DISCONNECT_CMD!");
-        if (!serial_tx(uart_, cmd))
+        if (!serial_tx(cmd))
         {
             ESP_LOGI(TAG, "Failed to tx DISCONNECT_CMD!");
             return false;

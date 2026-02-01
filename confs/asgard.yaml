@@ -1,0 +1,16 @@
+substitutions:
+  uart_rx_pin: 38
+  uart_tx_pin: 39
+  uart_proxy_rx_pin: 8
+  uart_proxy_tx_pin: 7
+  # enable asgard prefixes
+  asgard_prefix: ""
+
+<<: !include proxy-base.yaml
+<<: !include asgard-sensors.yaml
+<<: !include slave.yaml
+<<: !include asgard-led.yaml
+
+packages:
+ thermostat-room-0: !include { file: asgard-thermostat.yaml, vars: { zone_identifier: "z1", gpio: "GPIO40" } }
+ ${z2_yaml_prefix} thermostat-room-1: !include { file: asgard-thermostat.yaml, vars: { zone_identifier: "z2", gpio: "GPIO41" } }
